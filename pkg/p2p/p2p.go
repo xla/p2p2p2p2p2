@@ -1,9 +1,16 @@
 package p2p
 
-import "fmt"
+import (
+	"errors"
+)
 
 // defaultSubChanBuffer is used for subscription channel buffer size.
 const defaultSubChanBuffer = 1
+
+var (
+	ErrPeerAlreadyKnown = errors.New("peer already known")
+	ErrPeerNotPresent   = errors.New("peer not present")
+)
 
 // Behaviour observed of a peer and used as the basis for promotion (e.g.
 // trusted peer) or demotion (e.g. disconnect, bab with timeout).
@@ -35,17 +42,17 @@ type SubscriptionMsg struct {
 	chanID  ChanID
 	payload Payload
 	// TODO(xla): Rework into a proper faux enum which the consumer can switch on.
-	//			  Should support: peer added, peer removed.
+	//            Should support: peer added, peer removed.
 	flag uint8
 }
 
 // Interchange routes messages between peers and subscribers.
 // TODO(xla): Looks awfully lot like a Bus, maybe it's the better abstraction.
-//			  Something like `Broadcast` feels very natural as a potential extension of
-//			  this interface to support such a "gossip" concern.
+//            Something like `Broadcast` feels very natural as a potential extension of
+//            this interface to support such a "gossip" concern.
 type Interchange interface {
-	// Add(PeerID, peer) error
-	// Remove(PeerID) error
+	AddPeer(PeerID, peer) error
+	RemovePeer(PeerID) error
 
 	// TODO(xla): Do we want to support a shotgun dispatch?
 	// Broadcast issues a Dispatch for of the given message for all known peers.
@@ -55,7 +62,7 @@ type Interchange interface {
 	//
 	// Will error for cases where the peer has been disconnected as the caller
 	// should not be permitted any further dispatches after a peer has been
-	// removed. Yet concurrent disaptch for efficiency on the caller side could
+	// removed. Yet concurrent dispatch for efficiency on the caller side could
 	// lead to such cases easily.
 	Dispatch(PeerID, ChanID, Payload) error
 
@@ -67,11 +74,7 @@ type Interchange interface {
 // long-running concrete implementations and should be used by domain compossers
 // like the node.
 type InterchangeLifecycle interface {
-	// Run is blocking and will return only return when either Stop is called or
-	// the long-running engine can't recover.
-	// TODO(xla): Should Run really block? It makes it awkared in testing, which is
-	//			  either a good sign with regards to synchronous APIs or a bad sign as it
-	//			  indicates bad ergonomics for the caller.
+	// Run initiates routines for the Interchange.
 	Run() error
 
 	// Stop is called on a running Interchange to sginify shutdown. It is expected
@@ -89,7 +92,7 @@ var _ InterchangeLifecycle = (*ProcInterchange)(nil)
 type ProcInterchange struct {
 	// Internal counter used to ensure unique subscription IDs.
 	// TODO(xla): Use some collision free way of creating IDs and avoid inceasing
-	//			  numbers which potentially can overflow.
+	//            numbers which potentially can overflow.
 	id uint
 
 	// Peers mapping to keep track of connected nodes.
@@ -97,11 +100,19 @@ type ProcInterchange struct {
 	// Active subscriptions used to demux messages from connectedpeers.
 	subscriptions subscriptions
 
+	// Channel for added peer requests.
+	addPeerRequestc chan addPeerRequest
+	// Channel for remove peer requests.
+	removePeerRequestc chan removePeerRequest
+	// Channel for dispatch requests.
+	dispatchRequestc chan dispatchRequest
+	// Channel for all recieved peer messages.
+	receiveMsgc chan receiveMsg
 	// Channel used to make it known internally that the Interchange is stopped.
 	stopc chan struct{}
 	// Channel for intiial stop request and to coordinate for the call side to
 	// block until graceful shutdown is complete.
-	stopRequestc chan stopRequest
+	stopRequestc chan chan error
 	// Channel used to internally communicate a new subscription request.
 	subRequestc chan subRequest
 }
@@ -109,22 +120,69 @@ type ProcInterchange struct {
 // NewProcInterchange returns an Interchange instance.
 func NewProcInterchange() *ProcInterchange {
 	return &ProcInterchange{
-		id:            1,
-		peers:         map[PeerID]peer{},
-		subscriptions: subscriptions{},
-		stopc:         make(chan struct{}),
-		stopRequestc:  make(chan stopRequest),
-		subRequestc:   make(chan subRequest),
+		id:                 1,
+		peers:              map[PeerID]peer{},
+		subscriptions:      subscriptions{},
+		addPeerRequestc:    make(chan addPeerRequest),
+		removePeerRequestc: make(chan removePeerRequest),
+		dispatchRequestc:   make(chan dispatchRequest),
+		receiveMsgc:        make(chan receiveMsg),
+		stopc:              make(chan struct{}),
+		stopRequestc:       make(chan chan error),
+		subRequestc:        make(chan subRequest),
 	}
 }
 
+type addPeerRequest struct {
+	peerID PeerID
+	peer   peer
+	resc   chan error
+}
+
+type removePeerRequest struct {
+	peerID PeerID
+	resc   chan error
+}
+
+type peer interface {
+	receive() (Payload, error)
+	send(ChanID, Payload) error
+}
+
+// AddPeer implements Interchange.
+func (i *ProcInterchange) AddPeer(peerID PeerID, peer peer) error {
+	resc := make(chan error)
+	i.addPeerRequestc <- addPeerRequest{peerID: peerID, peer: peer, resc: resc}
+
+	return <-resc
+}
+
+// RemovePeer implements Interchange.
+func (i *ProcInterchange) RemovePeer(peerID PeerID) error {
+	resc := make(chan error)
+	i.removePeerRequestc <- removePeerRequest{peerID: peerID, resc: resc}
+
+	return <-resc
+}
+
+type dispatchRequest struct {
+	peerID  PeerID
+	chanID  ChanID
+	payload Payload
+	resc    chan error
+}
+
 // Dispatch implements Interchange.
-func (i *ProcInterchange) Dispatch(_ PeerID, _ ChanID, _ Payload) error {
-	// TODO(xla): Find peer with matching id.
-	// TODO(xla): Return error if peer is missing.
-	// TODO(xla): Attempt send.
-	// TODO(xla): Return send result.
-	return fmt.Errorf("not implemented")
+func (i *ProcInterchange) Dispatch(peerID PeerID, chanID ChanID, payload Payload) error {
+	resc := make(chan error)
+	i.dispatchRequestc <- dispatchRequest{
+		peerID:  peerID,
+		chanID:  chanID,
+		payload: payload,
+		resc:    resc,
+	}
+
+	return <-resc
 }
 
 // Subscribe implements Interchange.
@@ -139,23 +197,90 @@ func (i *ProcInterchange) Subscribe(chanID ChanID) (SubChan, UnsubscribeFunc, er
 
 // Run implements InterchangeLifecycle.
 func (i *ProcInterchange) Run() error {
+	go i.dmux()
+
+	return nil
+}
+
+// Stop implements InterchangeLifecycle.
+func (i *ProcInterchange) Stop() error {
+	resc := make(chan error)
+	i.stopRequestc <- resc
+
+	return <-resc
+}
+
+func (i *ProcInterchange) dmux() {
 	for {
 		select {
-		// Stop
-		case req := <-i.stopRequestc:
-			// TODO(xla): Initiate graceful shutdown.
-			close(i.stopc)
+		// ADD PEER
+		case req := <-i.addPeerRequestc:
+			_, ok := i.peers[req.peerID]
+			if ok {
+				// TODO(xla): Return proper error sentinel.
+				req.resc <- ErrPeerAlreadyKnown
+				continue
+			}
 
-			err := fmt.Errorf("stop not implemented")
-			req.resc <- err
-			return err
+			// TODO(xla): Notify all subscriptions of added peer.
+			i.peers[req.peerID] = req.peer
+
+			req.resc <- nil
+
+		// REMOVE PEER
+		case req := <-i.removePeerRequestc:
+			_, ok := i.peers[req.peerID]
+			if !ok {
+				// TODO(xla): Retunr proper error sentinel.
+				req.resc <- ErrPeerNotPresent
+				continue
+			}
+
+			// TODO(xla): Notify all subscriptions of removed peer.
+			delete(i.peers, req.peerID)
+
+			req.resc <- nil
+
+		// DISPATCH
+		case req := <-i.dispatchRequestc:
+			p, ok := i.peers[req.peerID]
+			if !ok {
+				// TODO(xla): Return proper error sentinel.
+				req.resc <- ErrPeerNotPresent
+				continue
+			}
+
+			// We ensure that dispatches are satisfied as fast as possible. This way it
+			// can be call in parallel and doesn't block when one of the peers is slow.
+			go func(p peer, chanID ChanID, payload Payload, resc chan error) {
+				resc <- p.send(chanID, payload)
+			}(p, req.chanID, req.payload, req.resc)
+
+		// RECEIVE
+		case msg := <-i.receiveMsgc:
+			subs, ok := i.subscriptions[msg.chanID]
+			if !ok {
+				continue
+			}
+
+			for _, subc := range subs {
+				subc <- SubscriptionMsg{peerID: msg.peerID, chanID: msg.chanID, flag: 0}
+			}
+
+		// Stop
+		case resc := <-i.stopRequestc:
+			// TODO(xla): Perform graceful shutdown.
+			close(i.stopc)
+			resc <- nil
+
+			return
 
 		// Subscription
 		case req := <-i.subRequestc:
 			// TODO(xla): Check if stopped and return an error to the subscriber.
-			//			  Alternatively just expect this routine to exit when stop has been
-			//			  called and expect here that we can never a receive a subscriotion
-			//			  request after stop has been called.
+			//            Alternatively just expect this routine to exit when stop has been
+			//            called and expect here that we can never a receive a subscriotion
+			//            request after stop has been called.
 			var (
 				chanID = req.chanID
 				nextID = i.id + 1
@@ -192,14 +317,6 @@ func (i *ProcInterchange) Run() error {
 	}
 }
 
-// Stop implements InterchangeLifecycle.
-func (i *ProcInterchange) Stop() error {
-	resc := make(chan error)
-	i.stopRequestc <- stopRequest{resc: resc}
-
-	return <-resc
-}
-
 func (i *ProcInterchange) isStopped() bool {
 	select {
 	case _, ok := <-i.stopc:
@@ -212,10 +329,6 @@ func (i *ProcInterchange) isStopped() bool {
 	}
 
 	return false
-}
-
-type stopRequest struct {
-	resc chan error
 }
 
 // subscriptions is used in the interchange to keep track of the mapping of
@@ -233,9 +346,10 @@ type subResponse struct {
 	unsubscribeFunc UnsubscribeFunc
 }
 
-type peer interface {
-	receive() ([]byte, error)
-	send([]byte) error
+type receiveMsg struct {
+	peerID  PeerID
+	chanID  ChanID
+	payload Payload
 }
 
 type reporter interface {
