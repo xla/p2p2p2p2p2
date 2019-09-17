@@ -2,6 +2,9 @@ package p2p
 
 import "fmt"
 
+// defaultSubChanBuffer is used for subscription channel buffer size.
+const defaultSubChanBuffer = 1
+
 // Behaviour observed of a peer and used as the basis for promotion (e.g.
 // trusted peer) or demotion (e.g. disconnect, bab with timeout).
 type Behaviour string
@@ -12,9 +15,6 @@ type ChanID = byte
 // SubChan returned for subscriptions for the subscriber be infomred about new
 // peer messages.
 type SubChan chan PeerMsg
-
-// defaultSubChanBuffer is used for subscription channel buffer size.
-const defaultSubChanBuffer = 1
 
 // UnsubscribeFunc ought to be called by a subscriber who is no longer
 // interested in the corresponding subscription. Shortly after the channel
@@ -45,8 +45,23 @@ type Interchange interface {
 	Subscribe(ChanID) (SubChan, UnsubscribeFunc, error)
 }
 
+// InterchangeLifecycle interface is expected to be satisfied by all
+// long-running concrete implementations and should be used by domain compossers
+// like the node.
+type InterchangeLifecycle interface {
+	// Run is blocking and will return only return when either Stop is called or
+	// the long-running engine can't recover.
+	Run() error
+
+	// Stop is called on a running Interchange to sginify shutdown. It is expected
+	// that any implementation is cleanly releasing all resources. An error is
+	// returned if any unexpected issue is encoutnered during graceful shutdown.
+	Stop() error
+}
+
 // Test procInterchange for interface completeness.
 var _ Interchange = (*procInterchange)(nil)
+var _ InterchangeLifecycle = (*procInterchange)(nil)
 
 type procInterchange struct {
 	// Internal counter used to ensure unique subscription IDs.
@@ -59,6 +74,11 @@ type procInterchange struct {
 	// Active subscriptions used to demux messages from connectedpeers.
 	subscriptions subscriptions
 
+	// Channel used to make it known internally that the Interchange is stopped.
+	stopc chan struct{}
+	// Channel for intiial stop request and to coordinate for the call side to
+	// block until graceful shutdown is complete.
+	stopRequestc chan stopRequest
 	// Channel used to internally communicate a new subscription request.
 	subRequestc chan subRequest
 }
@@ -69,6 +89,7 @@ func NewProcInterchange() Interchange {
 		id:            1,
 		peers:         map[PeerID]peer{},
 		subscriptions: subscriptions{},
+		stopc:         make(chan struct{}),
 		subRequestc:   make(chan subRequest),
 	}
 }
@@ -90,10 +111,18 @@ func (i *procInterchange) Subscribe(chanID ChanID) (SubChan, UnsubscribeFunc, er
 	return res.subc, res.unsubscribeFunc, res.err
 }
 
-func (i *procInterchange) dmux() error {
+func (i *procInterchange) Run() error {
 	for {
 		select {
+		// Stop
+		case req := <-i.stopRequestc:
+			// TODO(xla): Initiate graceful shutdown.
+			close(i.stopc)
+			req.resc <- fmt.Errorf("not implemented")
+
+		// Subscription
 		case req := <-i.subRequestc:
+			// TODO(xla): Check if stopped and return an error to the subscriber.
 			var (
 				chanID = req.chanID
 				nextID = i.id + 1
@@ -126,6 +155,31 @@ func (i *procInterchange) dmux() error {
 			}
 		}
 	}
+}
+
+func (i *procInterchange) Stop() error {
+	resc := make(chan error)
+	i.stopRequestc <- stopRequest{resc: resc}
+
+	return <-resc
+}
+
+func (i *procInterchange) isStopped() bool {
+	select {
+	case _, ok := <-i.stopc:
+		if !ok {
+			return true
+		}
+	default:
+		// Fall through as the channel is not closed and we assume the Interchange is
+		// running.
+	}
+
+	return false
+}
+
+type stopRequest struct {
+	resc chan error
 }
 
 // subscriptions is used in the interchange to keep track of the mapping of
