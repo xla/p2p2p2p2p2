@@ -84,12 +84,13 @@ type procInterchange struct {
 }
 
 // NewProcInterchange returns an Interchange instance.
-func NewProcInterchange() Interchange {
+func NewProcInterchange() *procInterchange {
 	return &procInterchange{
 		id:            1,
 		peers:         map[PeerID]peer{},
 		subscriptions: subscriptions{},
 		stopc:         make(chan struct{}),
+		stopRequestc:  make(chan stopRequest),
 		subRequestc:   make(chan subRequest),
 	}
 }
