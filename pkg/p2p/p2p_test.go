@@ -24,3 +24,14 @@ func TestInterchangeStop(t *testing.T) {
 
 	<-stopc
 }
+
+func TestInterchangeDispatch(t *testing.T) {
+	var (
+		ic = NewProcInterchange()
+	)
+	defer ic.Stop()
+
+	if err := ic.Run(); err != nil {
+		t.Fatal(err)
+	}
+}
