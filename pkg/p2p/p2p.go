@@ -51,9 +51,6 @@ type SubscriptionMsg struct {
 //            Something like `Broadcast` feels very natural as a potential extension of
 //            this interface to support such a "gossip" concern.
 type Interchange interface {
-	AddPeer(PeerID, peer) error
-	RemovePeer(PeerID) error
-
 	// TODO(xla): Do we want to support a shotgun dispatch?
 	// Broadcast issues a Dispatch for of the given message for all known peers.
 	// Broadcast(ChanID, Payload) error
@@ -79,19 +76,25 @@ type InterchangeLifecycle interface {
 
 	// Stop is called on a running Interchange to sginify shutdown. It is expected
 	// that any implementation is cleanly releasing all resources. An error is
-	// returned if any unexpected issue is encoutnered during graceful shutdown.
+	// returned if an unexpected issue is encoutnered during graceful shutdown.
 	Stop() error
+}
+
+type InterchangePeerManagement interface {
+	AddPeer(PeerID, peer) error
+	RemovePeer(PeerID) error
 }
 
 // Test ProcInterchange for interface completeness.
 var _ Interchange = (*ProcInterchange)(nil)
 var _ InterchangeLifecycle = (*ProcInterchange)(nil)
+var _ InterchangePeerManagement = (*ProcInterchange)(nil)
 
 // ProcInterchange is a concrete implementation of Interchange running entirely
 // in-process.
 type ProcInterchange struct {
 	// Internal counter used to ensure unique subscription IDs.
-	// TODO(xla): Use some collision free way of creating IDs and avoid inceasing
+	// TODO(xla): Use some collision free way of creating IDs and avoid increasing
 	//            numbers which potentially can overflow.
 	id uint
 
